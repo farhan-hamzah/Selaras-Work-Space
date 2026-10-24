@@ -33,9 +33,10 @@ export const TASK = Object.fromEntries(DEMO_TASKS.map((t) => [t.key, t.id])) as 
  *   - DemoUserKey      -> role "authenticated" dengan klaim JWT user tsb (seperti PostgREST)
  *   - 'anon'           -> role "anon" tanpa sesi
  *   - 'service_role'   -> role "service_role" (secret key; bypass RLS)
+ *   - 'supabase_auth'  -> server Supabase Auth (role "supabase_auth_admin", tanpa klaim JWT)
  *   - 'postgres'       -> pemilik database (SQL editor / migration)
  */
-export type Actor = DemoUserKey | 'anon' | 'service_role' | 'postgres'
+export type Actor = DemoUserKey | 'anon' | 'service_role' | 'supabase_auth' | 'postgres'
 
 export interface Outcome<T = Record<string, unknown>> {
   rows: T[]
@@ -141,6 +142,10 @@ async function enterRole(db: PGlite, actor: Actor) {
   if (actor === 'service_role') {
     await db.query(`select set_config('request.jwt.claims', $1, true)`, [JSON.stringify({ role: 'service_role' })])
     await db.exec('set local role service_role')
+    return
+  }
+  if (actor === 'supabase_auth') {
+    await db.exec('set local role supabase_auth_admin')
     return
   }
   await db.query(`select set_config('request.jwt.claims', $1, true)`, [

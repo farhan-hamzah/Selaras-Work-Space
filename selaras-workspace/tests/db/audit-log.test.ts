@@ -127,45 +127,144 @@ describe('Anti-pemalsuan & append-only (FR-LOG-04)', () => {
   })
 })
 
-describe('Event autentikasi lewat public.log_auth_event()', () => {
-  it('USER_LOGIN dicatat dengan user_id dari sesi & memperbarui last_login_at', async () => {
-    await asActor(db, 'citra', async (q) => {
-      expect((await q(`select public.log_auth_event('USER_LOGIN')`)).error).toBeNull()
+describe('Konteks request pada log perubahan data', () => {
+  it('IP & user agent pengguna akhir (header dari server Next.js) ikut tersimpan', async () => {
+    await asActor(db, 'budi', async (q) => {
+      await q(`select set_config('request.headers', $1, true)`, [
+        JSON.stringify({ 'x-client-ip': '203.0.113.7', 'x-client-user-agent': 'Vitest' }),
+      ])
+      await q(`update public.tasks set status = 'review' where id = $1`, [TASK.T1])
       await q('reset role')
-      const log = await q<LogRow>(`select user_id, action, resource_type from public.activity_logs where action = 'USER_LOGIN'`)
-      expect(log.rows).toEqual([{ user_id: USER_IDS.citra, action: 'USER_LOGIN', resource_type: 'auth' }])
+      const log = await q<{ ip_address: string; user_agent: string }>(
+        `select host(ip_address) as ip_address, user_agent from public.activity_logs
+         where resource_id = $1 and action = 'TASK_STATUS_CHANGED'`, [TASK.T1])
+      expect(log.rows[0]).toEqual({ ip_address: '203.0.113.7', user_agent: 'Vitest' })
+    })
+  })
+
+  it('Header IP yang rusak tidak membatalkan perubahan maupun pencatatan', async () => {
+    await asActor(db, 'budi', async (q) => {
+      await q(`select set_config('request.headers', $1, true)`, [JSON.stringify({ 'x-client-ip': 'bukan-ip' })])
+      const r = await q(`update public.tasks set status = 'review' where id = $1`, [TASK.T1])
+      expect(r.error).toBeNull()
+      expect(r.affected).toBe(1)
+    })
+  })
+})
+
+/**
+ * Revisi poin 2 — login/logout dicatat dari auth.sessions, yang hanya ditulis
+ * server Supabase Auth (actor 'supabase_auth'). Baris sesi di sini meniru apa
+ * yang ditulis Auth saat login (INSERT) dan logout (DELETE).
+ */
+describe('Revisi poin 2 — USER_LOGIN/USER_LOGOUT hanya dari sesi Supabase Auth', () => {
+  const SESSION_A = '5e55e55e-0000-4000-8000-00000000000a'
+  const SESSION_B = '5e55e55e-0000-4000-8000-00000000000b'
+  const createSession = `insert into auth.sessions (id, user_id, created_at, updated_at, aal, ip, user_agent, not_after)
+                         values ($1, $2, now(), now(), 'aal1', $3, $4, $5)`
+  const AUTH_LOGS = `select user_id, action, resource_type, metadata, host(ip_address) as ip, user_agent
+                     from public.activity_logs where action in ('USER_LOGIN', 'USER_LOGOUT') order by created_at`
+
+  interface AuthLogRow {
+    user_id: string
+    action: string
+    resource_type: string
+    metadata: Record<string, unknown>
+    ip: string | null
+    user_agent: string | null
+  }
+
+  it('Login (Auth membuat sesi) mencatat USER_LOGIN dengan session_id, IP & user agent dari Auth', async () => {
+    await asActor(db, 'supabase_auth', async (q) => {
+      const r = await q(createSession, [SESSION_A, USER_IDS.citra, '203.0.113.7', 'Vitest', null])
+      expect(r.error).toBeNull()
+      await q('reset role')
+      const logs = await q<AuthLogRow>(AUTH_LOGS)
+      expect(logs.rows).toEqual([
+        {
+          user_id: USER_IDS.citra,
+          action: 'USER_LOGIN',
+          resource_type: 'auth',
+          metadata: { session_id: SESSION_A, aal: 'aal1', account_active: true, actor_role: 'supabase_auth' },
+          ip: '203.0.113.7',
+          user_agent: 'Vitest',
+        },
+      ])
       const p = await q<{ last_login_at: string | null }>(`select last_login_at from public.profiles where id = $1`, [USER_IDS.citra])
       expect(p.rows[0].last_login_at).not.toBeNull()
     })
   })
 
-  it('Header request (IP & user agent) ikut tersimpan bila ada', async () => {
-    await asActor(db, 'citra', async (q) => {
-      await q(`select set_config('request.headers', $1, true)`, [
-        JSON.stringify({ 'x-client-ip': '203.0.113.7', 'user-agent': 'Vitest' }),
-      ])
-      await q(`select public.log_auth_event('USER_LOGOUT')`)
+  it('Logout (Auth menghapus sesi) mencatat USER_LOGOUT untuk sesi tersebut', async () => {
+    await asActor(db, 'supabase_auth', async (q) => {
+      await q(createSession, [SESSION_A, USER_IDS.citra, '203.0.113.7', 'Vitest', null])
+      expect((await q('delete from auth.sessions where id = $1', [SESSION_A])).affected).toBe(1)
       await q('reset role')
-      const log = await q<{ ip_address: string; user_agent: string }>(
-        `select host(ip_address) as ip_address, user_agent from public.activity_logs where action = 'USER_LOGOUT'`)
-      expect(log.rows[0]).toEqual({ ip_address: '203.0.113.7', user_agent: 'Vitest' })
+      const logs = await q<AuthLogRow>(AUTH_LOGS)
+      expect(logs.rows.map((l) => [l.action, l.metadata.session_id])).toEqual([
+        ['USER_LOGIN', SESSION_A],
+        ['USER_LOGOUT', SESSION_A],
+      ])
+      expect(logs.rows[1]).toMatchObject({ user_id: USER_IDS.citra, resource_type: 'auth' })
     })
   })
 
-  it('Header IP yang rusak tidak membatalkan pencatatan', async () => {
+  it('Logout global (semua sesi pengguna dihapus) mencatat satu USER_LOGOUT per sesi', async () => {
+    await asActor(db, 'supabase_auth', async (q) => {
+      await q(createSession, [SESSION_A, USER_IDS.citra, null, null, null])
+      await q(createSession, [SESSION_B, USER_IDS.citra, null, null, null])
+      await q('delete from auth.sessions where user_id = $1', [USER_IDS.citra])
+      await q('reset role')
+      const logouts = (await q<AuthLogRow>(AUTH_LOGS)).rows.filter((l) => l.action === 'USER_LOGOUT')
+      expect(logouts.map((l) => l.metadata.session_id).sort()).toEqual([SESSION_A, SESSION_B])
+    })
+  })
+
+  it('Sesi kedaluwarsa yang dibersihkan Auth tidak dicatat sebagai logout', async () => {
+    await asActor(db, 'supabase_auth', async (q) => {
+      await q(createSession, [SESSION_A, USER_IDS.citra, null, null, new Date(Date.now() - 4 * 86_400_000).toISOString()])
+      await q('delete from auth.sessions where id = $1', [SESSION_A])
+      await q('reset role')
+      expect((await q<AuthLogRow>(AUTH_LOGS)).rows.map((l) => l.action)).toEqual(['USER_LOGIN'])
+    })
+  })
+
+  it('Pengguna tidak bisa mencatat USER_LOGOUT/USER_LOGIN tanpa proses autentikasi', async () => {
     await asActor(db, 'citra', async (q) => {
-      await q(`select set_config('request.headers', $1, true)`, [JSON.stringify({ 'x-client-ip': 'bukan-ip' })])
-      expect((await q(`select public.log_auth_event('USER_LOGIN')`)).error).toBeNull()
+      // RPC lama sudah dihapus.
+      expect((await q(`select public.log_auth_event('USER_LOGOUT')`)).error?.code).toBe('42883')
+      // Menulis log langsung ditolak.
+      const forged = await q(
+        `insert into public.activity_logs (user_id, action, resource_type, description) values ($1, 'USER_LOGOUT', 'auth', 'palsu')`,
+        [USER_IDS.citra],
+      )
+      expect(forged.error?.code).toBe('42501')
+      // Tabel sesi milik Auth tidak bisa disentuh role API.
+      expect((await q(createSession, [SESSION_A, USER_IDS.citra, null, null, null])).error?.code).toBe('42501')
+      expect((await q('delete from auth.sessions')).error?.code).toBe('42501')
+      await q('reset role')
+      expect((await q<AuthLogRow>(AUTH_LOGS)).rows).toHaveLength(0)
     })
   })
 
-  it('Aksi lain tidak bisa dicatat lewat fungsi ini', async () => {
-    expect((await run(db, 'citra', `select public.log_auth_event('TASK_DELETED')`)).error?.code).toBe('22023')
+  it('Login akun nonaktif tetap tercatat dan ditandai account_active = false', async () => {
+    await asActor(db, 'supabase_auth', async (q) => {
+      await q(createSession, [SESSION_A, USER_IDS.fajar, null, null, null])
+      await q('reset role')
+      const [log] = (await q<AuthLogRow>(AUTH_LOGS)).rows
+      expect(log).toMatchObject({ user_id: USER_IDS.fajar, action: 'USER_LOGIN', metadata: { account_active: false } })
+    })
   })
 
-  it('Akun nonaktif dan anon ditolak', async () => {
-    expect((await run(db, 'fajar', `select public.log_auth_event('USER_LOGIN')`)).error?.code).toBe('42501')
-    expect((await run(db, 'anon', `select public.log_auth_event('USER_LOGIN')`)).error?.code).toBe('42501')
+  it('Fail-closed: bila log gagal disimpan, login (pembuatan sesi) ikut gagal', async () => {
+    await asActor(db, 'postgres', async (q) => {
+      await q('alter table public.activity_logs add constraint simulate_failure check (false) not valid')
+      await q('set local role supabase_auth_admin')
+      const r = await q(createSession, [SESSION_A, USER_IDS.citra, null, null, null])
+      expect(r.error?.code).toBe('23514')
+      await q('reset role')
+      expect((await q('select id from auth.sessions where id = $1', [SESSION_A])).rows).toHaveLength(0)
+    })
   })
 })
 

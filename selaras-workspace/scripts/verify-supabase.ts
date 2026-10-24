@@ -9,11 +9,13 @@
  *
  * Probe "edit" memakai UPDATE tanpa perubahan nilai (title = title lama):
  * lolos/tidaknya RLS terlihat dari jumlah baris yang kembali, tanpa mengubah
- * data dan tanpa menambah log. Keluar dengan kode 1 bila ada yang tidak sesuai.
+ * data dan tanpa menambah log. Probe revisi poin 1 mengeluarkan lalu
+ * menambahkan kembali Dewi; keanggotaannya selalu dikembalikan ke viewer.
+ * Keluar dengan kode 1 bila ada yang tidak sesuai.
  */
 import type { SupabaseClient } from '@supabase/supabase-js'
 import type { Database } from '../src/types/database'
-import { DEMO_PROJECTS, DEMO_TASKS, DEMO_USERS, demoEmail, type DemoUserKey } from './demo-data'
+import { DEMO_CHANGES, DEMO_PROJECTS, DEMO_TASKS, DEMO_USERS, demoEmail, type DemoUserKey } from './demo-data'
 import { createAdmin, createAnon, fail, requireVars } from './lib/script-env'
 
 const env = requireVars([
@@ -39,24 +41,66 @@ function record(area: string, check: string, expected: string, actual: string) {
   results.push({ area, check, expected, actual, ok: expected === actual })
 }
 
-const sessions = new Map<DemoUserKey, { client: Client; id: string }>()
+interface Session {
+  client: Client
+  id: string
+  /** Klaim session_id = auth.sessions.id, yang dicatat trigger audit login/logout. */
+  sessionId: string
+}
+const sessions = new Map<DemoUserKey, Session>()
 
-async function login(key: DemoUserKey) {
-  const cached = sessions.get(key)
-  if (cached) return cached
+function sessionIdOf(accessToken: string): string {
+  const claims = JSON.parse(Buffer.from(accessToken.split('.')[1], 'base64url').toString('utf8')) as { session_id?: string }
+  if (!claims.session_id) fail('Access token tidak memuat klaim session_id.')
+  return claims.session_id
+}
+
+/** Login sungguhan lewat Supabase Auth — setiap panggilan membuat sesi baru. */
+async function signIn(key: DemoUserKey): Promise<Session> {
   const user = DEMO_USERS.find((u) => u.key === key)!
   const client = createAnon(env.NEXT_PUBLIC_SUPABASE_URL, env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY)
   const { data, error } = await client.auth.signInWithPassword({
     email: demoEmail(user.localPart, domain),
     password: env.SEED_DEMO_PASSWORD,
   })
-  if (error || !data.user) fail(`Login sebagai ${key} gagal: ${error?.message}. Sudah \`npm run db:seed\`?`)
-  const session = { client, id: data.user.id }
+  if (error || !data.user || !data.session) fail(`Login sebagai ${key} gagal: ${error?.message}. Sudah \`npm run db:seed\`?`)
+  return { client, id: data.user.id, sessionId: sessionIdOf(data.session.access_token) }
+}
+
+async function login(key: DemoUserKey) {
+  const cached = sessions.get(key)
+  if (cached) return cached
+  const session = await signIn(key)
   sessions.set(key, session)
   return session
 }
 
 const admin = createAdmin(env.NEXT_PUBLIC_SUPABASE_URL, env.SUPABASE_SECRET_KEY)
+
+/**
+ * Revisi poin 1: owner mengeluarkan Dewi (viewer), mencoba menambahkannya lagi
+ * sebagai member (harus ditolak), lalu sebagai viewer (role sama, harus boleh).
+ * Apa pun hasilnya, keanggotaan Dewi dikembalikan ke viewer dengan secret key.
+ */
+async function probeReAddWithOtherRole(owner: Client, userId: string) {
+  const projectId = DEMO_PROJECTS[DEMO_CHANGES.demoteToViewer.project].id
+  const outcome = (r: { error: { code: string } | null }) => (r.error ? `error ${r.error.code}` : 'berhasil')
+  try {
+    const removed = await owner.from('project_members').delete().eq('project_id', projectId).eq('user_id', userId).select('user_id')
+    if (removed.error || removed.data.length !== 1) {
+      const why = removed.error ? `hapus: error ${removed.error.code}` : 'hapus: tidak ada baris'
+      return { asMember: why, asViewer: why }
+    }
+    const asMember = outcome(await owner.from('project_members').insert({ project_id: projectId, user_id: userId, role: 'member' }))
+    const asViewer = outcome(await owner.from('project_members').insert({ project_id: projectId, user_id: userId, role: 'viewer' }))
+    return { asMember, asViewer }
+  } finally {
+    const restore = await admin
+      .from('project_members')
+      .upsert({ project_id: projectId, user_id: userId, role: 'viewer' }, { onConflict: 'project_id,user_id' })
+    if (restore.error) console.error(`⚠ Gagal mengembalikan keanggotaan Dewi: ${restore.error.message}. Jalankan \`npm run db:seed -- --reset\`.`)
+  }
+}
 
 /** UPDATE tanpa perubahan nilai: 'diizinkan' bila baris lolos RLS, 'ditolak' bila tidak. */
 async function probeTaskEdit(key: DemoUserKey, taskKey: string) {
@@ -117,6 +161,10 @@ async function main() {
   const selfRpc = await budi.client.rpc('admin_set_user_role', { p_user_id: budi.id, p_role: 'admin' })
   record('Koreksi #1c', 'Budi memanggil admin_set_user_role', 'error 42501', selfRpc.error ? `error ${selfRpc.error.code}` : 'berhasil')
 
+  const reAdd = await probeReAddWithOtherRole((await login('rina')).client, (await login('dewi')).id)
+  record('Revisi #1', 'Rina (owner) keluarkan Dewi (viewer) lalu tambah lagi sbg member', 'error 42501', reAdd.asMember)
+  record('Revisi #1', 'Rina tambahkan Dewi kembali sbg viewer (role sama)', 'berhasil', reAdd.asViewer)
+
   // 3b. Audit log (koreksi #4) ---------------------------------------------------
   const forged = await budi.client
     .from('activity_logs')
@@ -125,18 +173,32 @@ async function main() {
   const budiLogs = await budi.client.from('activity_logs').select('id')
   record('Koreksi #4', 'Staff membaca audit log', '0', String(budiLogs.data?.length ?? 'error'))
 
-  const citra = await login('citra')
-  const logged = await citra.client.rpc('log_auth_event', { p_action: 'USER_LOGIN' })
-  record('Koreksi #4', 'log_auth_event(USER_LOGIN) di-await', 'tersimpan', logged.error ? `error ${logged.error.code}` : 'tersimpan')
+  // 3c. Login/logout dicatat dari sesi Supabase Auth (revisi poin 2) -------------
   const adminSession = await login('admin')
-  const lastLogin = await adminSession.client
-    .from('activity_logs')
-    .select('user_id, action')
-    .eq('action', 'USER_LOGIN')
-    .eq('user_id', citra.id)
-    .order('created_at', { ascending: false })
-    .limit(1)
-  record('Koreksi #4', 'Admin melihat USER_LOGIN milik Citra', 'ada', lastLogin.data?.length === 1 ? 'ada' : 'tidak ada')
+  const authLogCount = async (action: 'USER_LOGIN' | 'USER_LOGOUT', sessionId: string) => {
+    const { data, error } = await adminSession.client
+      .from('activity_logs')
+      .select('id')
+      .eq('action', action)
+      .contains('metadata', { session_id: sessionId })
+    return error ? `error ${error.code}` : String(data.length)
+  }
+
+  const citra = await login('citra')
+  record('Revisi #2', 'Login Citra tercatat USER_LOGIN untuk sesinya', '1', await authLogCount('USER_LOGIN', citra.sessionId))
+
+  // RPC lama sudah dihapus; tipe Database tidak lagi memuatnya.
+  const forgedLogout = await budi.client.rpc('log_auth_event' as never, { p_action: 'USER_LOGOUT' } as never)
+  record('Revisi #2', 'Budi memanggil log_auth_event (RPC lama)', 'error PGRST202', forgedLogout.error ? `error ${forgedLogout.error.code}` : 'berhasil')
+  record('Revisi #2', 'USER_LOGOUT untuk sesi Budi yang masih aktif', '0', await authLogCount('USER_LOGOUT', budi.sessionId))
+
+  const extra = await signIn('citra') // sesi terpisah khusus uji logout
+  const signedOut = await extra.client.auth.signOut({ scope: 'local' })
+  record(
+    'Revisi #2', 'Citra logout tercatat USER_LOGOUT untuk sesinya', '1',
+    signedOut.error ? `error ${signedOut.error.code}` : await authLogCount('USER_LOGOUT', extra.sessionId),
+  )
+
   const tamper = await adminSession.client.from('activity_logs').delete().eq('user_id', citra.id).select('id')
   record('Koreksi #4', 'Admin menghapus log (append-only)', 'error 42501', tamper.error ? `error ${tamper.error.code}` : `terhapus ${tamper.data.length}`)
 }

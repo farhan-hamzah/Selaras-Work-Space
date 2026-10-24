@@ -264,7 +264,6 @@ export type Database = {
       };
       admin_set_user_role: { Args: { p_role: string; p_user_id: string }; Returns: undefined };
       health_check: { Args: Record<PropertyKey, never>; Returns: Json };
-      log_auth_event: { Args: { p_action: string }; Returns: undefined };
       soft_delete_project: { Args: { p_project_id: string }; Returns: undefined };
       soft_delete_task: { Args: { p_task_id: string }; Returns: undefined };
     };
