@@ -212,6 +212,85 @@ describe('Matriks Projects (SRS 3.7)', () => {
   })
 })
 
+describe('Revisi poin 1 — role per-project tidak bisa diubah lewat hapus lalu tambah lagi', () => {
+  const remove = `delete from public.project_members where project_id = $1 and user_id = $2`
+  const add = `insert into public.project_members (project_id, user_id, role) values ($1, $2, $3)`
+
+  it('Rina (owner) mengeluarkan Dewi (viewer) lalu menambahkannya lagi sebagai member: ditolak, tanpa log', async () => {
+    await asActor(db, 'rina', async (q) => {
+      expect((await q(remove, [PROJECT.alpha, USER_IDS.dewi])).affected).toBe(1)
+      const r = await q(add, [PROJECT.alpha, USER_IDS.dewi, 'member'])
+      expect(r.error?.code).toBe('42501')
+      expect(r.error?.message).toContain('hanya bisa dilakukan Admin')
+      await q('reset role')
+      const added = await q(
+        `select 1 from public.activity_logs where action = 'PROJECT_MEMBER_ADDED' and user_id = $1`, [USER_IDS.rina])
+      expect(added.rows).toHaveLength(0)
+    })
+  })
+
+  it('Menambahkan lagi tanpa menyebut role (default member) juga ditolak', async () => {
+    await asActor(db, 'rina', async (q) => {
+      await q(remove, [PROJECT.alpha, USER_IDS.dewi])
+      const r = await q(`insert into public.project_members (project_id, user_id) values ($1, $2)`, [PROJECT.alpha, USER_IDS.dewi])
+      expect(r.error?.code).toBe('42501')
+    })
+  })
+
+  it('Arah sebaliknya juga ditolak: member dikeluarkan lalu ditambah lagi sebagai viewer', async () => {
+    await asActor(db, 'rina', async (q) => {
+      await q(remove, [PROJECT.alpha, USER_IDS.budi])
+      expect((await q(add, [PROJECT.alpha, USER_IDS.budi, 'viewer'])).error?.code).toBe('42501')
+    })
+  })
+
+  it('Menambahkan lagi dengan role yang SAMA tetap boleh (mis. salah mengeluarkan)', async () => {
+    await asActor(db, 'rina', async (q) => {
+      await q(remove, [PROJECT.alpha, USER_IDS.dewi])
+      expect((await q(add, [PROJECT.alpha, USER_IDS.dewi, 'viewer'])).error).toBeNull()
+      await q(remove, [PROJECT.alpha, USER_IDS.citra])
+      expect((await q(add, [PROJECT.alpha, USER_IDS.citra, 'member'])).error).toBeNull()
+    })
+  })
+
+  it('Admin tetap boleh mengeluarkan lalu menambahkan lagi dengan role berbeda', async () => {
+    await asActor(db, 'admin', async (q) => {
+      await q(remove, [PROJECT.alpha, USER_IDS.dewi])
+      expect((await q(add, [PROJECT.alpha, USER_IDS.dewi, 'member'])).error).toBeNull()
+    })
+  })
+
+  it('Yang dipakai adalah role TERAKHIR: setelah Admin menaikkan Dewi jadi member, owner boleh menambahkannya lagi sebagai member', async () => {
+    await asActor(db, 'postgres', async (q) => {
+      const as = async (user: keyof typeof USER_IDS) => {
+        await q('reset role')
+        await q(`select set_config('request.jwt.claims', $1, true)`, [JSON.stringify({ sub: USER_IDS[user], role: 'authenticated' })])
+        await q('set local role authenticated')
+      }
+      await as('admin')
+      await q(`update public.project_members set role = 'member' where project_id = $1 and user_id = $2`, [PROJECT.alpha, USER_IDS.dewi])
+      await as('rina')
+      await q(remove, [PROJECT.alpha, USER_IDS.dewi])
+      expect((await q(add, [PROJECT.alpha, USER_IDS.dewi, 'viewer'])).error?.code).toBe('42501')
+      expect((await q(add, [PROJECT.alpha, USER_IDS.dewi, 'member'])).error).toBeNull()
+    })
+  })
+
+  it('Owner tidak bisa membaca atau menghapus riwayat untuk mengakali aturan', async () => {
+    await asActor(db, 'rina', async (q) => {
+      await q(remove, [PROJECT.alpha, USER_IDS.dewi])
+      expect((await q('select * from private.project_member_removals')).error?.code).toBe('42501')
+      expect((await q('delete from private.project_member_removals')).error?.code).toBe('42501')
+      expect((await q(add, [PROJECT.alpha, USER_IDS.dewi, 'member'])).error?.code).toBe('42501')
+    })
+  })
+
+  it('Pengguna yang belum pernah menjadi anggota tetap bisa ditambahkan owner dengan role member/viewer', async () => {
+    expect((await run(db, 'rina', add, [PROJECT.alpha, USER_IDS.eko, 'viewer'])).error).toBeNull()
+    expect((await run(db, 'eko', add, [PROJECT.beta, USER_IDS.citra, 'member'])).error).toBeNull()
+  })
+})
+
 describe('Matriks Tasks (SRS 3.7, D2)', () => {
   it('Lihat: Admin semua; anggota hanya project-nya', async () => {
     expect((await run(db, 'admin', 'select id from public.tasks')).rows).toHaveLength(7)
@@ -316,11 +395,12 @@ describe('Visibilitas profile', () => {
 })
 
 /**
- * Pembanding: memasang kembali policy dari Implementation Plan v0.2 (di dalam
- * transaksi yang di-rollback) untuk membuktikan celahnya nyata — dan bahwa
- * test di atas memang sensitif terhadap celah tersebut.
+ * Pembanding: memasang kembali policy dari Implementation Plan v0.2, atau
+ * melepas guard hasil revisi (di dalam transaksi yang di-rollback), untuk
+ * membuktikan celahnya nyata — dan bahwa test di atas memang sensitif
+ * terhadap celah tersebut.
  */
-describe('Pembanding — policy v0.2 (sebelum koreksi) memang bocor', () => {
+describe('Pembanding — kondisi sebelum koreksi/revisi memang bocor', () => {
   const asUser = (user: keyof typeof USER_IDS) => [
     `select set_config('request.jwt.claims', '${JSON.stringify({ sub: USER_IDS[user], role: 'authenticated' })}', true)`,
     'set local role authenticated',
@@ -341,6 +421,22 @@ describe('Pembanding — policy v0.2 (sebelum koreksi) memang bocor', () => {
       await q('reset role')
       for (const s of asUser('fajar')) await q(s)
       expect((await q(...updateTaskStatus('T4', 'done'))).affected).toBe(1) // akun nonaktif berhasil edit
+    })
+  })
+
+  it('Sebelum revisi poin 1 (tanpa guard): owner BISA menaikkan Viewer jadi Member lewat hapus lalu tambah lagi', async () => {
+    await asActor(db, 'postgres', async (q) => {
+      await q('drop trigger guard_project_member_insert on public.project_members')
+      for (const s of asUser('rina')) await q(s)
+      await q(`delete from public.project_members where project_id = $1 and user_id = $2`, [PROJECT.alpha, USER_IDS.dewi])
+      const r = await q(
+        `insert into public.project_members (project_id, user_id, role) values ($1, $2, 'member')`,
+        [PROJECT.alpha, USER_IDS.dewi],
+      )
+      expect(r.error).toBeNull()
+      await q('reset role')
+      for (const s of asUser('dewi')) await q(s)
+      expect((await q(...updateTaskTitle('T3'))).affected).toBe(1) // mantan viewer kini bisa edit
     })
   })
 

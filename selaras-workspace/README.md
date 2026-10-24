@@ -79,7 +79,7 @@ Penting:
 npm run db:push
 ```
 
-Ada 4 migration di `supabase/migrations/`. Supabase mencatat migration yang sudah diterapkan, jadi perintah ini aman
+Ada 6 migration di `supabase/migrations/`. Supabase mencatat migration yang sudah diterapkan, jadi perintah ini aman
 diulang dan hanya menerapkan migration yang baru. Kalau ingin melihat dulu apa yang akan dijalankan:
 `npm run db:push -- --dry-run`.
 
@@ -114,8 +114,10 @@ npm run verify:supabase
 
 Skrip ini login sungguhan sebagai akun-akun demo, lalu mencoba aksi yang seharusnya diizinkan dan yang seharusnya
 ditolak. Contoh: viewer yang membuat task mencoba mengeditnya, akun nonaktif yang JWT-nya masih valid, Staff yang
-mencoba menaikkan role-nya sendiri, dan pemalsuan audit log. Hasilnya dicetak sebagai tabel ✓/✗. Probe edit
-memakai UPDATE tanpa perubahan nilai, jadi data contoh tidak berubah.
+mencoba menaikkan role-nya sendiri, owner yang mencoba mengubah role lewat hapus lalu tambah lagi, pemalsuan audit
+log, serta login/logout yang harus tercatat per sesi. Hasilnya dicetak sebagai tabel ✓/✗. Probe edit memakai UPDATE
+tanpa perubahan nilai. Probe hapus-lalu-tambah mengeluarkan Dewi lalu selalu mengembalikannya sebagai viewer. Jadi
+data contoh tetap sama; yang bertambah hanya entri audit log.
 
 ---
 
@@ -181,8 +183,10 @@ lengkap ada di [`scripts/demo-data.ts`](scripts/demo-data.ts) dan dipakai bersam
 - **`npm run test:db`** menjalankan migration asli di PGlite (PostgreSQL 18 versi WebAssembly) dengan stub minimal
   lingkungan Supabase: role `anon`/`authenticated`/`service_role`, `auth.uid()` dari klaim JWT, dan default
   privileges Supabase. Query dijalankan dengan cara yang sama seperti PostgREST (`SET ROLE authenticated` + klaim
-  JWT), dan setiap test di-rollback. Yang diuji: seluruh sel matriks permission, empat koreksi, dan *test pembanding*
-  yang memasang kembali policy v0.2 untuk membuktikan bahwa celahnya memang nyata.
+  JWT), dan setiap test di-rollback. Login/logout ditiru dengan menulis `auth.sessions` sebagai role
+  `supabase_auth_admin`, seperti yang dilakukan Supabase Auth. Yang diuji: seluruh sel matriks permission, empat
+  koreksi, revisi review, dan *test pembanding* yang memasang kembali kondisi lama untuk membuktikan bahwa celahnya
+  memang nyata.
 - **`tests/unit`** menguji validasi env (secret key yang tertukar ke variabel publik) dan klasifikasi health check
   terhadap server HTTP tiruan.
 - **`npm run verify:supabase`** adalah verifikasi ujung-ke-ujung terhadap project Supabase sungguhan.
